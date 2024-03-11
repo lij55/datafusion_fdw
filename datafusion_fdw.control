@@ -1,0 +1,5 @@
+comment = 'datafusion_fdw:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/datafusion_fdw'
+relocatable = false
+superuser = true
