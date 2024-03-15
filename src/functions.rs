@@ -2,12 +2,14 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::ptr::addr_of_mut;
 
+use async_std::task;
+use datafusion::arrow::array::RecordBatch;
 use pgrx::memcxt::PgMemoryContexts;
 use pgrx::pg_sys::{AsPgCStr, TopMemoryContext};
 use pgrx::PgTupleDesc;
 use pgrx::prelude::*;
 
-use crate::utils::{generate_test_data_for_oid, SerdeList};
+use crate::utils::{generate_test_data_for_oid, run_df_sql, SerdeList};
 
 #[pg_guard]
 pub extern "C" fn datafusion_get_foreign_rel_size(
@@ -88,6 +90,8 @@ pub extern "C" fn datafusion_get_foreign_plan(
     unsafe {
         let state = PgBox::<DataFusionFdwStat>::from_pg((*baserel).fdw_private as _);
 
+        let scan_clauses = pg_sys::extract_actual_clauses(scan_clauses, false);
+
         let ctx = PgMemoryContexts::For(state.self_ctx.value());
 
         let fdw_private = DataFusionFdwStat::serialize_to_list(state, ctx);
@@ -112,6 +116,7 @@ struct DataFusionFdwStat {
     pub total: u64,
     // query conditions
     pub quals: Vec<String>,
+    pub df_result: Option<Vec<RecordBatch>>,
 }
 
 impl SerdeList for DataFusionFdwStat {}
@@ -123,7 +128,7 @@ impl DataFusionFdwStat {
             total: 0,
             quals: Vec::new(),
             self_ctx,
-
+            df_result: None,
         }
     }
 }
@@ -144,9 +149,18 @@ pub extern "C" fn datafusion_begin_foreign_scan(
         let mut state = DataFusionFdwStat::deserialize_from_list((*plan).fdw_private as _);
         assert!(!state.is_null());
 
-        (*node).fdw_state = state.into_pg() as _;
+
         // deparse, where, join, sort and limit
         // run remote query
+        state.df_result = match run_df_sql() {
+            Ok(v) => match (task::block_on(v.collect())) {
+                Ok(v) => Some(v),
+                _ => None
+            }
+            _ => None
+        };
+
+        (*node).fdw_state = state.into_pg() as _;
     }
 }
 
