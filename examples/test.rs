@@ -95,7 +95,7 @@ fn transpose2<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
         .collect()
 }
 
-pub fn recordbatch_to_row2(batch: RecordBatch) -> Vec<Vec<String>> {
+pub fn transpose_recordbatch(batch: RecordBatch) -> Vec<Vec<String>> {
     let ret = batch.columns().iter().map(|c| {
         c.as_primitive::<Int32Type>().iter().map(|v| format!("{}", v.unwrap_or(0))).collect()
     }
@@ -117,7 +117,8 @@ pub fn recordbatch_to_row(batch: RecordBatch) -> Vec<Vec<String>> {
 
 fn main() -> Result<()> {
     // execute the query
-    let df = run_df_sql().unwrap();
+    //let df = run_df_sql().unwrap();
+    let df = run_df_sql_local().unwrap();
 
     // print the results
     //task::block_on(df.clone().show()).unwrap();
@@ -133,7 +134,7 @@ fn main() -> Result<()> {
         //     }).collect::<Vec<String>>().join(",");
         //     //println!("{}", result);
         // }
-        let result = recordbatch_to_row2(records);
+        let result = transpose_recordbatch(records);
         for i in result {
             // println!("{}", i.join(";"))
         }
@@ -182,5 +183,30 @@ fn run_df_sql() -> Result<DataFrame> {
 
     // execute the query
     let df = task::block_on(ctx.sql("SELECT \"RegionID\"  FROM hits order by \"RegionID\" limit 1000000;"));
+    return df;
+}
+
+fn run_df_sql_local() -> Result<DataFrame> {
+    let config =
+        SessionConfig::new()
+            .with_create_default_catalog_and_schema(true)
+            .with_target_partitions(8)
+            .with_information_schema(true)
+            .with_parquet_pruning(true)
+            .with_parquet_bloom_filter_pruning(true)
+            .with_batch_size(6666)
+        ;
+
+    let ctx = SessionContext::new_with_config(config);
+
+    task::block_on(ctx.register_parquet(
+        "hits",
+        &format!("/home/liyang/hits_10.parquet"),
+        ParquetReadOptions::default(),
+    ));
+
+
+    // execute the query
+    let df = task::block_on(ctx.sql("SELECT \"RegionID\"  FROM hits order by \"RegionID\" limit 100;"));
     return df;
 }

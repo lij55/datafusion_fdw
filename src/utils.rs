@@ -2,12 +2,12 @@ use std::str::{from_utf8, FromStr};
 use std::sync::Arc;
 
 use async_std::task;
-use datafusion::arrow::array::{Array, AsArray, BinaryArray, BooleanArray, StringArray};
+use datafusion::arrow::array::{Array, AsArray, BinaryArray, BooleanArray, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, TimeUnit, UInt32Type};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::ListingOptions;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use object_store::aws::AmazonS3Builder;
 use pgrx::*;
 use pgrx::IntoDatum;
@@ -187,6 +187,7 @@ pub fn run_df_sql() -> datafusion::common::Result<DataFrame> {
             .with_information_schema(true)
             .with_parquet_pruning(true)
             .with_parquet_bloom_filter_pruning(true)
+            .with_batch_size(6666)
         ;
 
     let ctx = SessionContext::new_with_config(config);
@@ -217,7 +218,32 @@ pub fn run_df_sql() -> datafusion::common::Result<DataFrame> {
     ).expect("TODO: panic message");
 
     // execute the query
-    let df = task::block_on(ctx.sql("SELECT \"RegionID\" from hits order by 1 LIMIT 10;"));
+    let df = task::block_on(ctx.sql("SELECT \"RegionID\" from hits order by 1 limit 10;"));
 
+    return df;
+}
+
+pub fn run_df_sql_local() -> datafusion::common::Result<DataFrame> {
+    let config =
+        SessionConfig::new()
+            .with_create_default_catalog_and_schema(true)
+            .with_target_partitions(8)
+            .with_information_schema(true)
+            .with_parquet_pruning(true)
+            .with_parquet_bloom_filter_pruning(true)
+            .with_batch_size(6666)
+        ;
+
+    let ctx = SessionContext::new_with_config(config);
+
+    task::block_on(ctx.register_parquet(
+        "hits",
+        &format!("/home/liyang/hits_10.parquet"),
+        ParquetReadOptions::default(),
+    ));
+
+
+    // execute the query
+    let df = task::block_on(ctx.sql("SELECT \"RegionID\"  FROM hits order by \"RegionID\" limit 100;"));
     return df;
 }

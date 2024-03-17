@@ -1,15 +1,18 @@
 use std::os::raw::c_int;
 use std::ptr;
 use std::ptr::addr_of_mut;
+use std::iter;
+use std::slice::Iter;
 
 use async_std::task;
 use datafusion::arrow::array::RecordBatch;
 use pgrx::memcxt::PgMemoryContexts;
-use pgrx::pg_sys::{AsPgCStr, TopMemoryContext};
+use pgrx::pg_sys::{AsPgCStr, Datum, TopMemoryContext};
 use pgrx::PgTupleDesc;
 use pgrx::prelude::*;
 
-use crate::utils::{generate_test_data_for_oid, run_df_sql, SerdeList};
+use crate::utils::{generate_test_data_for_oid, run_df_sql, run_df_sql_local, SerdeList};
+use crate::results::DFResult;
 
 #[pg_guard]
 pub extern "C" fn datafusion_get_foreign_rel_size(
@@ -116,7 +119,8 @@ struct DataFusionFdwStat {
     pub total: u64,
     // query conditions
     pub quals: Vec<String>,
-    pub df_result: Option<Vec<RecordBatch>>,
+
+    pub df_result: Option<DFResult>,
 }
 
 impl SerdeList for DataFusionFdwStat {}
@@ -152,9 +156,9 @@ pub extern "C" fn datafusion_begin_foreign_scan(
 
         // deparse, where, join, sort and limit
         // run remote query
-        state.df_result = match run_df_sql() {
+        state.df_result = match run_df_sql_local() {
             Ok(v) => match (task::block_on(v.collect())) {
-                Ok(v) => Some(v),
+                Ok(v) => Some(DFResult::new(v)),
                 _ => None
             }
             _ => None
@@ -183,7 +187,7 @@ pub extern "C" fn datafusion_end_foreign_scan(_node: *mut pg_sys::ForeignScanSta
 pub extern "C" fn datafusion_iterate_foreign_scan(
     node: *mut pg_sys::ForeignScanState,
 ) -> *mut pg_sys::TupleTableSlot {
-    //debug2!("---> iterate_foreign_scan");
+    debug2!("---> iterate_foreign_scan");
     unsafe {
         let mut state = PgBox::<DataFusionFdwStat>::from_pg((*node).fdw_state as _);
         let slot = (*node).ss.ss_ScanTupleSlot;
@@ -192,27 +196,47 @@ pub extern "C" fn datafusion_iterate_foreign_scan(
         if let Some(clear) = (*(*slot).tts_ops).clear {
             clear(slot);
         }
-        if state.current < state.total {
-            state.current += 1;
-        } else {
-            debug2!("---> iterate_foreign_scan done");
+
+        if state.df_result.is_none() {
+            return slot;
+        };
+
+        // if state.current < state.total {
+        //     state.current += 1;
+        // } else {
+        //     debug2!("---> iterate_foreign_scan done");
+        //     return slot;
+        // }
+
+        let next_row = state.df_result.as_mut().unwrap().next_record();
+
+        if next_row.is_none() {
             return slot;
         }
+
+        let next_row = next_row.unwrap();
+
+        let mut value_iter = next_row.iter();
 
         let tup_desc = (*slot).tts_tupleDescriptor;
 
         let tuple_desc = PgTupleDesc::from_pg_copy(tup_desc);
 
+        // for (col_index, attr) in tuple_desc.iter().enumerate() {
+        //     let tts_isnull = (*slot).tts_isnull.add(col_index);
+        //     let tts_value = (*slot).tts_values.add(col_index);
+        //
+        //     match generate_test_data_for_oid(attr.atttypid) {
+        //         Some(v) => *tts_value = v,
+        //         None => *tts_isnull = true,
+        //     }
+        // }
         for (col_index, attr) in tuple_desc.iter().enumerate() {
             let tts_isnull = (*slot).tts_isnull.add(col_index);
             let tts_value = (*slot).tts_values.add(col_index);
 
-            match generate_test_data_for_oid(attr.atttypid) {
-                Some(v) => *tts_value = v,
-                None => *tts_isnull = true,
-            }
+            *tts_value = *value_iter.next().unwrap();
         }
-
 
         pgrx::prelude::pg_sys::ExecStoreVirtualTuple(slot);
 

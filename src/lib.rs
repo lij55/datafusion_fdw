@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 
 mod functions;
 mod utils;
+mod results;
 
 pgrx::pg_module_magic!();
 
