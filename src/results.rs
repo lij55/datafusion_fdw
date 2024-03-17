@@ -36,12 +36,12 @@ pub struct DFResult {
     done: bool,
 }
 
-impl DFResult<> {
-    pub fn new(mut record_batches: Vec<RecordBatch> ) -> DFResult<> {
+impl DFResult {
+    pub fn new(mut record_batches: Vec<RecordBatch> ) -> DFResult {
         let mut ret =
             DFResult {
-            batch_iter: record_batches.into_iter(), // default iter returns None
-            record_iter: Default::default(),
+            batch_iter: record_batches.into_iter(),
+            record_iter: Default::default(), // default iter returns None
                 done: false
         };
         ret.update_cache();
@@ -49,25 +49,33 @@ impl DFResult<> {
     }
 
     pub fn next_record(&mut self) -> Option<Vec<Datum>> {
-        let next_cache_item = self.record_iter.next();
-        if next_cache_item.is_some() {
-            return Some(next_cache_item.unwrap());
+        match self.record_iter.next() {
+            None =>{
+                self.update_cache();
+                self.record_iter.next()
+            },
+            Some(v) => {
+                Some(v)
+            }
         }
-        self.update_cache();
-        return self.record_iter.next();
 
     }
 
     pub fn finished(self) -> bool {self.done}
     fn update_cache(&mut self) {
-        let batch_to_cache = self.batch_iter.next();
-        if batch_to_cache.is_none() {
-            // done
-            self.done = true;
+        if self.done {
             return;
         }
-        let cached_records = transpose_recordbatch(&batch_to_cache.unwrap());
-        self.record_iter = cached_records.into_iter();
+
+        match self.batch_iter.next() {
+            None => {
+                self.done = true;
+            }
+            Some(batch) => {
+                let cached_records = transpose_recordbatch(&batch);
+                self.record_iter = cached_records.into_iter();
+            }
+        }
 
     }
 }

@@ -1,3 +1,4 @@
+use std::ffi::CStr;
 use std::str::{from_utf8, FromStr};
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use object_store::aws::AmazonS3Builder;
 use pgrx::*;
 use pgrx::IntoDatum;
-use pgrx::pg_sys::{Datum, Oid};
+use pgrx::pg_sys::{Datum, Oid, PgNode};
 use url::Url;
 
 pub(super) trait SerdeList {
@@ -223,7 +224,7 @@ pub fn run_df_sql() -> datafusion::common::Result<DataFrame> {
     return df;
 }
 
-pub fn run_df_sql_local() -> datafusion::common::Result<DataFrame> {
+pub fn run_df_sql_local(sql_str: &str) -> datafusion::common::Result<DataFrame> {
     let config =
         SessionConfig::new()
             .with_create_default_catalog_and_schema(true)
@@ -244,6 +245,31 @@ pub fn run_df_sql_local() -> datafusion::common::Result<DataFrame> {
 
 
     // execute the query
-    let df = task::block_on(ctx.sql("SELECT \"RegionID\"  FROM hits order by \"RegionID\" limit 100;"));
+    let df = task::block_on(ctx.sql(sql_str));
     return df;
+}
+
+
+// extract target column name and attribute no list
+pub unsafe fn extract_target_columns(
+    root: *mut pg_sys::PlannerInfo,
+    baserel: *mut pg_sys::RelOptInfo,
+    foreigntableid: pg_sys::Oid
+) -> Vec<String> {
+
+    //let mut col_vars: *mut pg_sys::List = ptr::null_mut();
+    let mut ret = vec![];
+
+    // gather vars from target column list
+    let tgt_list: PgList<pg_sys::Node> = PgList::from_pg((*(*baserel).reltarget).exprs);
+    for tgt in tgt_list.iter_ptr() {
+        let v = tgt as *const pg_sys::Var;
+        let attname = pg_sys::get_attname(foreigntableid, (*v).varattno, false);
+
+        ret.push(format!("{}",CStr::from_ptr(attname).to_str().unwrap().to_owned()));
+
+    }
+
+    ret
+
 }

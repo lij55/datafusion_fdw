@@ -1,24 +1,22 @@
 use std::os::raw::c_int;
 use std::ptr;
 use std::ptr::addr_of_mut;
-use std::iter;
-use std::slice::Iter;
+
 
 use async_std::task;
-use datafusion::arrow::array::RecordBatch;
 use pgrx::memcxt::PgMemoryContexts;
 use pgrx::pg_sys::{AsPgCStr, Datum, TopMemoryContext};
 use pgrx::PgTupleDesc;
 use pgrx::prelude::*;
 
-use crate::utils::{generate_test_data_for_oid, run_df_sql, run_df_sql_local, SerdeList};
+use crate::utils::{generate_test_data_for_oid, run_df_sql, run_df_sql_local, SerdeList, extract_target_columns};
 use crate::results::DFResult;
 
 #[pg_guard]
 pub extern "C" fn datafusion_get_foreign_rel_size(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     baserel: *mut pg_sys::RelOptInfo,
-    _foreigntableid: pg_sys::Oid,
+    foreigntableid: pg_sys::Oid,
 ) {
     debug2!("---> get_foreign_rel_size");
     // it is the first called fdw function.
@@ -43,6 +41,8 @@ pub extern "C" fn datafusion_get_foreign_rel_size(
 
 
         let ctx = my_fdw_state.self_ctx.value();
+
+        my_fdw_state.target_cols = extract_target_columns(root, baserel, foreigntableid);
 
 
         (*baserel).fdw_private = PgMemoryContexts::For(ctx).leak_and_drop_on_delete(my_fdw_state) as _;
@@ -118,7 +118,8 @@ struct DataFusionFdwStat {
     pub current: u64,
     pub total: u64,
     // query conditions
-    pub quals: Vec<String>,
+    pub target_cols: Vec<String>,
+    
 
     pub df_result: Option<DFResult>,
 }
@@ -130,7 +131,7 @@ impl DataFusionFdwStat {
         Self {
             current: 0,
             total: 0,
-            quals: Vec::new(),
+            target_cols: Vec::new(),
             self_ctx,
             df_result: None,
         }
@@ -143,10 +144,7 @@ pub extern "C" fn datafusion_begin_foreign_scan(
     eflags: c_int,
 ) {
     debug2!("---> begin_foreign_scan");
-    if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int > 0 {
-        log!("explain only, do nothing");
-        return;
-    }
+
     unsafe {
         let scan_state = (*node).ss;
         let plan = scan_state.ps.plan as *mut pg_sys::ForeignScan;
@@ -156,13 +154,21 @@ pub extern "C" fn datafusion_begin_foreign_scan(
 
         // deparse, where, join, sort and limit
         // run remote query
-        state.df_result = match run_df_sql_local() {
-            Ok(v) => match (task::block_on(v.collect())) {
-                Ok(v) => Some(DFResult::new(v)),
+
+        if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int > 0 {
+            debug2!("explain only, do nothing");
+        } else {
+
+            let sql_str = format!(r#"SELECT "{}" from hits;"#, state.target_cols.join(","));
+            debug2!("{sql_str}");
+            state.df_result = match run_df_sql_local(sql_str.as_str()) {
+                Ok(v) => match (task::block_on(v.collect())) {
+                    Ok(v) => Some(DFResult::new(v)),
+                    _ => None
+                }
                 _ => None
-            }
-            _ => None
-        };
+            };
+        }
 
         (*node).fdw_state = state.into_pg() as _;
     }
@@ -201,41 +207,23 @@ pub extern "C" fn datafusion_iterate_foreign_scan(
             return slot;
         };
 
-        // if state.current < state.total {
-        //     state.current += 1;
-        // } else {
-        //     debug2!("---> iterate_foreign_scan done");
-        //     return slot;
-        // }
+        let mut value_iter = match state.df_result.as_mut().unwrap().next_record() {
+            None => {return slot},
+            Some(v) => v.into_iter(),
+        };
 
-        let next_row = state.df_result.as_mut().unwrap().next_record();
-
-        if next_row.is_none() {
-            return slot;
-        }
-
-        let next_row = next_row.unwrap();
-
-        let mut value_iter = next_row.iter();
 
         let tup_desc = (*slot).tts_tupleDescriptor;
 
         let tuple_desc = PgTupleDesc::from_pg_copy(tup_desc);
 
-        // for (col_index, attr) in tuple_desc.iter().enumerate() {
-        //     let tts_isnull = (*slot).tts_isnull.add(col_index);
-        //     let tts_value = (*slot).tts_values.add(col_index);
-        //
-        //     match generate_test_data_for_oid(attr.atttypid) {
-        //         Some(v) => *tts_value = v,
-        //         None => *tts_isnull = true,
-        //     }
-        // }
         for (col_index, attr) in tuple_desc.iter().enumerate() {
             let tts_isnull = (*slot).tts_isnull.add(col_index);
             let tts_value = (*slot).tts_values.add(col_index);
-
-            *tts_value = *value_iter.next().unwrap();
+            // todo: check datatype
+            // check null
+            *tts_value = value_iter.next().unwrap(); // todo: use Option<Datum>
+            *tts_isnull = false;
         }
 
         pgrx::prelude::pg_sys::ExecStoreVirtualTuple(slot);
@@ -243,6 +231,30 @@ pub extern "C" fn datafusion_iterate_foreign_scan(
         slot
     }
 }
+
+#[pg_guard]
+pub(super) extern "C" fn datafusion_explain_foreign_scan(
+    node: *mut pg_sys::ForeignScanState,
+    es: *mut pg_sys::ExplainState,
+) {
+    debug2!("---> explain_foreign_scan");
+    unsafe {
+        let mut state = PgBox::<DataFusionFdwStat>::from_pg((*node).fdw_state as _);
+        if state.is_null() {
+            return;
+        }
+
+        let ctx = PgMemoryContexts::CurrentMemoryContext;
+
+        let label = ctx.pstrdup("Remote Query");
+
+        let value = ctx.pstrdup(&format!("select {} from datafusion",
+        state.target_cols.join(",")));
+        pg_sys::ExplainPropertyText(label, value, es);
+
+    }
+}
+
 
 pub static mut DATAFUSION_FDW_ROUTINE: pg_sys::FdwRoutine = pg_sys::FdwRoutine {
     type_: pg_sys::NodeTag::T_FdwRoutine,
@@ -275,7 +287,7 @@ pub static mut DATAFUSION_FDW_ROUTINE: pg_sys::FdwRoutine = pg_sys::FdwRoutine {
     GetForeignRelSize: Some(datafusion_get_foreign_rel_size),
     GetForeignPaths: Some(datafusion_get_foreign_paths),
     GetForeignPlan: Some(datafusion_get_foreign_plan),
-    ExplainForeignScan: None,
+    ExplainForeignScan: Some(datafusion_explain_foreign_scan),
     ExplainForeignModify: None,
     ExplainDirectModify: None,
     AnalyzeForeignTable: None,

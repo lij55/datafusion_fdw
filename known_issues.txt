@@ -1,0 +1,2 @@
+1. raise effor if column doesn't exist
+2. other data type

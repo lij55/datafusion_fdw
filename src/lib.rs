@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 mod functions;
 mod utils;
 mod results;
+mod server;
 
 pgrx::pg_module_magic!();
 
